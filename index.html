@@ -7,11 +7,10 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 
-<!-- React + ReactDOM (UMD builds — no bundler/npm needed) -->
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<!-- Babel Standalone transpiles the JSX below directly in the browser -->
 <script crossorigin src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
 <style>
   html, body, #root { margin: 0; height: 100%; }
@@ -35,9 +34,7 @@
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 // ---------------------------------------------------------------------------
-// Inline icon set (small SVGs) — replaces the lucide-react npm dependency
-// so this file has zero install step. Same visual language as the outline
-// icon set used in the Vite build.
+// Inline icon set (small SVGs)
 // ---------------------------------------------------------------------------
 const Icon = ({ path, size = 16, ...rest }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...rest}>
@@ -60,12 +57,11 @@ const MonitorIcon = (p) => <Icon {...p} path={<><rect x="2" y="3" width="20" hei
 const ClipboardListIcon = (p) => <Icon {...p} path={<><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/></>} />;
 
 // ---------------------------------------------------------------------------
-// Constants / helpers
+// Constants & Persistent Identity Setup
 // ---------------------------------------------------------------------------
 const SELF_NAME_KEY = 'usbox:selfName';
 const SELF_COLOR_KEY = 'usbox:selfColor';
 
-// Retrieve or initialize a persistent local identity
 function getSelfIdentity() {
   let name = localStorage.getItem(SELF_NAME_KEY);
   let color = localStorage.getItem(SELF_COLOR_KEY);
@@ -106,7 +102,7 @@ function nextLayer(objects) { return Math.max(0, ...objects.map((o) => o.layer))
 function slugify(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
 
 // ---------------------------------------------------------------------------
-// Room codes + saved rooms
+// Room codes + local saved rooms
 // ---------------------------------------------------------------------------
 const ROOM_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function genRoomCode(len = 6) {
@@ -131,7 +127,7 @@ function loadRoomState(code) {
   } catch { return null; }
 }
 function saveRoomState(code, state) {
-  try { localStorage.setItem(ROOM_STATE_PREFIX + code, JSON.stringify(state)); } catch { /* storage may be unavailable */ }
+  try { localStorage.setItem(ROOM_STATE_PREFIX + code, JSON.stringify(state)); } catch { }
 }
 function loadSavedRooms() {
   try {
@@ -145,12 +141,12 @@ function upsertSavedRoom(code, title) {
   const entry = { code, title, lastOpened: Date.now() };
   if (idx >= 0) rooms[idx] = entry; else rooms.push(entry);
   rooms.sort((a, b) => b.lastOpened - a.lastOpened);
-  try { localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(rooms.slice(0, 30))); } catch { /* storage may be unavailable */ }
+  try { localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(rooms.slice(0, 30))); } catch { }
   return rooms;
 }
 function removeSavedRoom(code) {
   const rooms = loadSavedRooms().filter((r) => r.code !== code);
-  try { localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(rooms)); } catch { /* storage may be unavailable */ }
+  try { localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(rooms)); } catch { }
   return rooms;
 }
 function timeAgo(ts) {
@@ -177,37 +173,53 @@ function centerW(o) { return o.w ?? 200; }
 function centerH(o) { return o.h ?? 140; }
 
 // ---------------------------------------------------------------------------
-// useRoomSocket — now connects to a public PartyKit server for real syncing!
+// Reliable real-time syncing using EMQX public secure MQTT Broker
 // ---------------------------------------------------------------------------
-const PUBLIC_PARTYKIT_HOST = "https://partykit-sandbox.partykit.dev";
-
-function useRoomSocket(roomCode, selfName, selfColor, onRemoteSync) {
-  const socketRef = useRef(null);
+function useRoomSocket(roomCode, selfName, selfColor, onRemoteSync, getLocalState) {
+  const clientRef = useRef(null);
   const [presence, setPresence] = useState({});
   const myUserId = useRef(uid('user')).current;
+  const topic = `usbox/rooms/${roomCode.toLowerCase()}`;
 
   useEffect(() => {
-    // Generate a sandbox websocket endpoint using our room code
-    const wsUrl = `wss://partykit-sandbox.partykit.dev/party/usbox-${roomCode.toLowerCase()}`;
-    const ws = new WebSocket(wsUrl);
-    socketRef.current = ws;
+    // Connect to EMQX secure websocket endpoint
+    const client = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
+    clientRef.current = client;
 
-    ws.onopen = () => {
-      // Announce arrival to all clients
-      ws.send(JSON.stringify({ t: 'presence:join', userId: myUserId, name: selfName, color: selfColor }));
-    };
+    client.on('connect', () => {
+      client.subscribe(topic, (err) => {
+        if (!err) {
+          // Tell everyone in the room we just joined
+          const joinMsg = JSON.stringify({ t: 'presence:join', userId: myUserId, name: selfName, color: selfColor });
+          client.publish(topic, joinMsg);
+        }
+      });
+    });
 
-    ws.onmessage = (evt) => {
+    client.on('message', (top, payload) => {
       try {
-        const msg = JSON.parse(evt.data);
-        
-        // Ignore loopbacked messages from ourselves
+        const msg = JSON.parse(payload.toString());
+        // Ignore our own looped back messages
         if (msg.userId === myUserId) return;
 
         if (msg.t === 'presence:join') {
-          // Add newly joined peer and answer back with our presence details
           setPresence((prev) => ({ ...prev, [msg.userId]: { userId: msg.userId, name: msg.name, color: msg.color } }));
-          ws.send(JSON.stringify({ t: 'presence:welcome_reply', userId: myUserId, name: selfName, color: selfColor }));
+          // Welcome them and send our identity back
+          const welcomeMsg = JSON.stringify({ t: 'presence:welcome_reply', userId: myUserId, name: selfName, color: selfColor });
+          client.publish(topic, welcomeMsg);
+
+          // IMPORTANT: If we have existing items in our room, send the entire current canvas state 
+          // so the new person has the exact same layout instantly!
+          const localState = getLocalState();
+          if (localState.objects.length > 0 || localState.connectors.length > 0) {
+            client.publish(topic, JSON.stringify({
+              t: 'room:initial_sync',
+              userId: myUserId,
+              title: localState.title,
+              objects: localState.objects,
+              connectors: localState.connectors
+            }));
+          }
         }
         if (msg.t === 'presence:welcome_reply') {
           setPresence((prev) => ({ ...prev, [msg.userId]: { userId: msg.userId, name: msg.name, color: msg.color } }));
@@ -229,27 +241,29 @@ function useRoomSocket(roomCode, selfName, selfColor, onRemoteSync) {
           setPresence((prev) => ({ ...prev, [msg.userId]: { ...(prev[msg.userId] ?? { name: '?', color: '#888' }), userId: msg.userId, micOn: msg.micOn } }));
         }
         
-        // Dispatch all other operations (drawing, object changes, connectors) to main app state
         onRemoteSync(msg);
-      } catch (err) {
-        console.error("Socket packet processing error", err);
+      } catch (e) {
+        console.error("Failed to parse packet", e);
       }
-    };
+    });
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ t: 'presence:leave', userId: myUserId }));
+      if (client.connected) {
+        client.publish(topic, JSON.stringify({ t: 'presence:leave', userId: myUserId }), {}, () => {
+          client.end();
+        });
+      } else {
+        client.end();
       }
-      ws.close();
     };
-  }, [roomCode, selfName, selfColor, onRemoteSync]);
+  }, [roomCode, selfName, selfColor, onRemoteSync, getLocalState, myUserId, topic]);
 
   const send = useCallback((envelope) => {
-    const ws = socketRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ ...envelope, userId: myUserId }));
+    const client = clientRef.current;
+    if (client && client.connected) {
+      client.publish(topic, JSON.stringify({ ...envelope, userId: myUserId }));
     }
-  }, [myUserId]);
+  }, [myUserId, topic]);
 
   return { send, presence };
 }
@@ -385,9 +399,7 @@ function RoomPanel({ roomCode, savedRooms, onCreateNew, onJoin, onSwitch, onRemo
       await navigator.clipboard.writeText(link);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API fallback
-    }
+    } catch { }
   };
   const tryJoin = () => { const c = joinInput.trim().toUpperCase(); if (c) onJoin(c); };
   return (
@@ -820,7 +832,7 @@ function UsBoxCanvas() {
   const [savedRooms, setSavedRooms] = useState(() => upsertSavedRoom(initialRoom.code, initialRoom.title));
   const [showRoomPanel, setShowRoomPanel] = useState(false);
 
-  // Sound triggering fallback (AudioContext browser sound generation)
+  // Sound triggering AudioContext fallback
   const playLocalBeep = (freq, type = 'sine') => {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -837,8 +849,14 @@ function UsBoxCanvas() {
     } catch {}
   };
 
-  // Remote updates handler
+  // Remote updates event router
   const handleRemoteSync = useCallback((msg) => {
+    if (msg.t === 'room:initial_sync') {
+      // Received the current layout from the oldest active peer in the room
+      setRoomTitle(msg.title);
+      setObjects(msg.objects);
+      setConnectors(msg.connectors);
+    }
     if (msg.t === 'object:create') {
       setObjects((prev) => {
         if (prev.some((o) => o.id === msg.obj.id)) return prev;
@@ -873,7 +891,12 @@ function UsBoxCanvas() {
     }
   }, []);
 
-  const { presence, send } = useRoomSocket(roomCode, SELF_NAME, SELF_COLOR, handleRemoteSync);
+  // Pass current local state accessor to useRoomSocket to share with joining clients
+  const getLocalState = useCallback(() => {
+    return { title: roomTitle, objects, connectors };
+  }, [roomTitle, objects, connectors]);
+
+  const { send, presence } = useRoomSocket(roomCode, SELF_NAME, SELF_COLOR, handleRemoteSync, getLocalState);
 
   const [micOn, setMicOn] = useState(false);
   const [micError, setMicError] = useState(null);
