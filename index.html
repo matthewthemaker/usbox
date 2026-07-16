@@ -93,6 +93,37 @@ function extractYouTubeId(url) {
   const m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([\w-]{11})/);
   return m ? m[1] : null;
 }
+
+// YouTube IFrame API loader (for synced playback)
+let ytApiReady = null;
+function loadYouTubeAPI() {
+  if (window.YT?.Player) return Promise.resolve();
+  if (ytApiReady) return ytApiReady;
+  ytApiReady = new Promise((resolve) => {
+    window.onYouTubeIframeAPIReady = () => resolve();
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  });
+  return ytApiReady;
+}
+
+// Lightweight message bus for WebRTC / video sync between cards and the room socket
+function createMessageBus() {
+  const listeners = new Set();
+  return {
+    emit(msg) { listeners.forEach((fn) => fn(msg)); },
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+  };
+}
+const rtcBus = createMessageBus();
+const videoBus = createMessageBus();
+
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+
+function shouldProcessTargeted(msg, myUserId) {
+  return !msg.targetUserId || msg.targetUserId === myUserId;
+}
 function uid(prefix) { return `${prefix}_${Math.random().toString(36).slice(2, 9)}`; }
 function worldToScreen(p, vp) { return { x: (p.x - vp.x) * vp.zoom, y: (p.y - vp.y) * vp.zoom }; }
 function screenToWorld(p, vp) { return { x: p.x / vp.zoom + vp.x, y: p.y / vp.zoom + vp.y }; }
@@ -265,7 +296,7 @@ function useRoomSocket(roomCode, selfName, selfColor, onRemoteSync, getLocalStat
     }
   }, [myUserId, topic]);
 
-  return { send, presence };
+  return { send, presence, myUserId };
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +523,106 @@ function VideoFallbackCard({ youtubeId, height }) {
   );
 }
 
-function VideoWindowCard({ win, selected, onFocus, onChange, onDelete, onClickForConnect, connectMode, viewportZoom }) {
+function VideoWindowCard({ win, selected, onFocus, onChange, onDelete, onClickForConnect, connectMode, viewportZoom, send, syncState }) {
   const dragRef = useDrag(win.x, win.y, (x, y) => onChange({ x, y }), viewportZoom);
   const resizeRef = useResize(win.w, win.h, (w, h) => onChange({ w: Math.max(220, w), h: Math.max(140, h) }), viewportZoom);
+  const playerHostRef = useRef(null);
+  const playerRef = useRef(null);
+  const applyingRemote = useRef(false);
+  const lastRemoteApply = useRef(0);
+  const lastSyncSend = useRef(0);
+  const [playerReady, setPlayerReady] = useState(false);
+
+  const broadcastSync = useCallback(() => {
+    const p = playerRef.current;
+    if (!win.syncEnabled || !p?.getCurrentTime || applyingRemote.current) return;
+    const now = Date.now();
+    if (now - lastSyncSend.current < 250) return;
+    lastSyncSend.current = now;
+    send({
+      t: 'video:sync',
+      objId: win.id,
+      playing: p.getPlayerState() === YT.PlayerState.PLAYING,
+      currentTime: p.getCurrentTime(),
+      videoId: win.youtubeId,
+    });
+  }, [win.syncEnabled, win.id, win.youtubeId, send]);
+
+  useEffect(() => {
+    if (IS_FILE_PROTOCOL) return;
+    let player = null;
+    let cancelled = false;
+    setPlayerReady(false);
+    loadYouTubeAPI().then(() => {
+      if (cancelled || !playerHostRef.current) return;
+      player = new YT.Player(playerHostRef.current, {
+        videoId: win.youtubeId,
+        width: '100%',
+        height: win.h - 30,
+        playerVars: { playsinline: 1, rel: 0, enablejsapi: 1, origin: window.location.origin },
+        events: {
+          onReady: () => { if (!cancelled) { playerRef.current = player; setPlayerReady(true); } },
+          onStateChange: (e) => {
+            if (!win.syncEnabled || applyingRemote.current || Date.now() - lastRemoteApply.current < 1500) return;
+            if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.BUFFERING) {
+              broadcastSync();
+            }
+          },
+        },
+      });
+    });
+    return () => {
+      cancelled = true;
+      player?.destroy?.();
+      playerRef.current = null;
+      setPlayerReady(false);
+    };
+  }, [win.youtubeId, win.h]);
+
+  useEffect(() => {
+    if (!win.syncEnabled || !playerReady) return;
+    const interval = setInterval(() => {
+      if (playerRef.current?.getPlayerState?.() === YT.PlayerState.PLAYING) broadcastSync();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [win.syncEnabled, playerReady, broadcastSync]);
+
+  useEffect(() => {
+    if (!win.syncEnabled || !playerReady) return;
+    send({ t: 'video:state_request', objId: win.id });
+  }, [win.id, win.syncEnabled, playerReady, send]);
+
+  useEffect(() => {
+    return videoBus.subscribe((msg) => {
+      if (msg.t !== 'video:state_request' || msg.objId !== win.id || !win.syncEnabled) return;
+      const p = playerRef.current;
+      if (!p?.getCurrentTime) return;
+      send({
+        t: 'video:sync',
+        objId: win.id,
+        playing: p.getPlayerState() === YT.PlayerState.PLAYING,
+        currentTime: p.getCurrentTime(),
+        videoId: win.youtubeId,
+      });
+    });
+  }, [win.id, win.syncEnabled, win.youtubeId, send]);
+
+  useEffect(() => {
+    if (!syncState || !playerReady || !win.syncEnabled) return;
+    const p = playerRef.current;
+    if (!p?.getCurrentTime) return;
+    applyingRemote.current = true;
+    lastRemoteApply.current = Date.now();
+    const drift = Math.abs(p.getCurrentTime() - syncState.currentTime);
+    if (drift > 1.5) p.seekTo(syncState.currentTime, true);
+    if (syncState.playing) {
+      if (p.getPlayerState() !== YT.PlayerState.PLAYING) p.playVideo();
+    } else if (p.getPlayerState() === YT.PlayerState.PLAYING) {
+      p.pauseVideo();
+    }
+    setTimeout(() => { applyingRemote.current = false; }, 600);
+  }, [syncState, playerReady, win.syncEnabled]);
+
   return (
     <div
       style={{ position: 'absolute', left: win.x, top: win.y, width: win.w, height: win.h, zIndex: win.layer, background: '#0F1712', borderRadius: 10, boxShadow: selected ? '0 0 0 3px #E7A93D, 0 12px 24px rgba(0,0,0,0.35)' : '0 12px 24px rgba(0,0,0,0.35)', overflow: 'hidden', border: '1px solid rgba(251,246,236,0.08)' }}
@@ -503,7 +631,7 @@ function VideoWindowCard({ win, selected, onFocus, onChange, onDelete, onClickFo
       <div {...dragRef} style={{ height: 30, background: '#1B211D', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 8px', cursor: 'grab', fontFamily: 'var(--font-mono)', fontSize: 11, color: '#8FA396' }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ width: 6, height: 6, borderRadius: 999, background: win.syncEnabled ? '#4FB3A9' : '#5A6B60' }} />
-          {win.syncEnabled ? 'synced' : 'independent'}
+          {win.syncEnabled ? 'watching together' : 'solo'}
         </span>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <button onClick={(e) => { e.stopPropagation(); onChange({ syncEnabled: !win.syncEnabled }); }} style={TINY_BTN}>{win.syncEnabled ? 'unsync' : 'sync'}</button>
@@ -513,46 +641,170 @@ function VideoWindowCard({ win, selected, onFocus, onChange, onDelete, onClickFo
       {IS_FILE_PROTOCOL ? (
         <VideoFallbackCard youtubeId={win.youtubeId} height={win.h - 30} />
       ) : (
-        <iframe title={win.id} width="100%" height={win.h - 30} src={`https://www.youtube-nocookie.com/embed/${win.youtubeId}?playsinline=1&rel=0`} referrerPolicy="strict-origin-when-cross-origin" frameBorder={0} allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen style={{ pointerEvents: connectMode ? 'none' : 'auto' }} />
+        <div ref={playerHostRef} style={{ width: '100%', height: win.h - 30, pointerEvents: connectMode ? 'none' : 'auto' }} />
       )}
       <div {...resizeRef} style={RESIZE_HANDLE_STYLE} />
     </div>
   );
 }
 
-function ScreenShareWindowCard({ win, selected, onFocus, onChange, onDelete, onClickForConnect, connectMode, viewportZoom }) {
+function ScreenShareWindowCard({ win, selected, onFocus, onChange, onDelete, onClickForConnect, connectMode, viewportZoom, send, myUserId, selfName }) {
   const dragRef = useDrag(win.x, win.y, (x, y) => onChange({ x, y }), viewportZoom);
   const resizeRef = useResize(win.w, win.h, (w, h) => onChange({ w: Math.max(260, w), h: Math.max(180, h) }), viewportZoom);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const [sharing, setSharing] = useState(false);
+  const peerMapRef = useRef(new Map());
+  const [localSharing, setLocalSharing] = useState(false);
+  const [remoteStream, setRemoteStream] = useState(null);
   const [error, setError] = useState(null);
+  const [connecting, setConnecting] = useState(false);
+
+  const isBroadcaster = localSharing || (win.sharing && win.sharerUserId === myUserId);
+  const isViewer = !isBroadcaster && win.sharing && win.sharerUserId && win.sharerUserId !== myUserId;
+  const sharerLabel = win.sharerName || 'Someone';
+
+  const closePeer = useCallback((peerId) => {
+    const pc = peerMapRef.current.get(peerId);
+    if (pc) {
+      pc.close();
+      peerMapRef.current.delete(peerId);
+    }
+  }, []);
+
+  const closeAllPeers = useCallback(() => {
+    peerMapRef.current.forEach((pc) => pc.close());
+    peerMapRef.current.clear();
+  }, []);
 
   const stopShare = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    setSharing(false);
-  }, []);
+    setLocalSharing(false);
+    closeAllPeers();
+    onChange({ sharing: false, sharerUserId: null, sharerName: null });
+    send({ t: 'screenshare:stop', objId: win.id });
+  }, [closeAllPeers, onChange, send, win.id]);
+
+  const makePeer = useCallback((peerId) => {
+    closePeer(peerId);
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        send({ t: 'webrtc:ice', objId: win.id, candidate: e.candidate, targetUserId: peerId });
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closePeer(peerId);
+    };
+    peerMapRef.current.set(peerId, pc);
+    return pc;
+  }, [closePeer, send, win.id]);
+
+  const startBroadcasterPeer = useCallback(async (viewerId) => {
+    if (!streamRef.current) return;
+    const pc = makePeer(viewerId);
+    streamRef.current.getTracks().forEach((track) => pc.addTrack(track, streamRef.current));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ t: 'webrtc:offer', objId: win.id, sdp: offer, targetUserId: viewerId });
+  }, [makePeer, send, win.id]);
 
   const startShare = useCallback(async () => {
+    if (win.sharing && win.sharerUserId && win.sharerUserId !== myUserId) {
+      setError(`${sharerLabel} is already sharing in this window.`);
+      return;
+    }
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       streamRef.current = stream;
       stream.getVideoTracks()[0].addEventListener('ended', stopShare);
-      setSharing(true);
+      setLocalSharing(true);
+      onChange({ sharing: true, sharerUserId: myUserId, sharerName: selfName });
+      send({ t: 'screenshare:start', objId: win.id, sharerName: selfName });
     } catch {
-      setError("Screen share was cancelled or blocked.");
+      setError('Screen share was cancelled or blocked.');
     }
-  }, [stopShare]);
+  }, [win.sharing, win.sharerUserId, myUserId, sharerLabel, stopShare, onChange, selfName, send, win.id]);
+
+  const connectAsViewer = useCallback(async () => {
+    if (!isViewer || connecting) return;
+    setConnecting(true);
+    setError(null);
+    send({ t: 'webrtc:request', objId: win.id, targetUserId: win.sharerUserId });
+    setTimeout(() => setConnecting(false), 8000);
+  }, [isViewer, connecting, send, win.id, win.sharerUserId]);
 
   useEffect(() => {
-    if (sharing && videoRef.current && streamRef.current) {
+    if (localSharing && videoRef.current && streamRef.current) {
       videoRef.current.srcObject = streamRef.current;
     }
-  }, [sharing]);
+  }, [localSharing]);
 
-  useEffect(() => () => { streamRef.current?.getTracks().forEach((t) => t.stop()); }, []);
+  useEffect(() => {
+    if (remoteStream && videoRef.current) {
+      videoRef.current.srcObject = remoteStream;
+    }
+  }, [remoteStream]);
+
+  useEffect(() => {
+    if (!isViewer) {
+      setRemoteStream(null);
+      closeAllPeers();
+      return;
+    }
+    connectAsViewer();
+  }, [isViewer, win.sharerUserId]);
+
+  useEffect(() => {
+    return rtcBus.subscribe(async (msg) => {
+      if (msg.objId !== win.id || !shouldProcessTargeted(msg, myUserId)) return;
+
+      if (msg.t === 'webrtc:request' && isBroadcaster) {
+        await startBroadcasterPeer(msg.userId);
+      }
+      if (msg.t === 'webrtc:offer' && !isBroadcaster) {
+        const pc = makePeer(msg.userId);
+        pc.ontrack = (e) => {
+          setRemoteStream(e.streams[0] || null);
+          setConnecting(false);
+          setError(null);
+        };
+        await pc.setRemoteDescription(msg.sdp);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ t: 'webrtc:answer', objId: win.id, sdp: answer, targetUserId: msg.userId });
+      }
+      if (msg.t === 'webrtc:answer' && isBroadcaster) {
+        const pc = peerMapRef.current.get(msg.userId);
+        if (pc) await pc.setRemoteDescription(msg.sdp);
+      }
+      if (msg.t === 'webrtc:ice') {
+        const pc = peerMapRef.current.get(msg.userId);
+        if (pc && msg.candidate) {
+          try { await pc.addIceCandidate(msg.candidate); } catch { }
+        }
+      }
+      if (msg.t === 'screenshare:stop') {
+        if (isViewer) {
+          setRemoteStream(null);
+          closeAllPeers();
+        }
+      }
+    });
+  }, [win.id, myUserId, isBroadcaster, isViewer, makePeer, startBroadcasterPeer, closeAllPeers, send]);
+
+  useEffect(() => () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    closeAllPeers();
+  }, [closeAllPeers]);
+
+  const showVideo = localSharing || (isViewer && remoteStream);
+  const statusText = localSharing
+    ? 'You are sharing — everyone in the box can see this'
+    : isViewer
+      ? (remoteStream ? `Watching ${sharerLabel}'s screen` : `Connecting to ${sharerLabel}'s screen…`)
+      : 'Screen share';
 
   return (
     <div
@@ -560,26 +812,33 @@ function ScreenShareWindowCard({ win, selected, onFocus, onChange, onDelete, onC
       onPointerDown={() => { onFocus(); if (connectMode) onClickForConnect(); }}
     >
       <div {...dragRef} style={{ height: 30, background: '#1B211D', display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px', cursor: 'grab', fontFamily: 'var(--font-mono)', fontSize: 11, color: '#8FA396' }}>
-        <span style={{ width: 6, height: 6, borderRadius: 999, background: sharing ? '#4FB3A9' : '#5A6B60', flexShrink: 0 }} />
+        <span style={{ width: 6, height: 6, borderRadius: 999, background: (localSharing || remoteStream) ? '#4FB3A9' : '#5A6B60', flexShrink: 0 }} />
         <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#CBD6CE' }}>
-          {sharing ? 'Sharing your screen' : 'Screen share'}
+          {statusText}
         </span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
-          <button onClick={(e) => { e.stopPropagation(); sharing ? stopShare() : startShare(); }} style={TINY_BTN}>{sharing ? 'stop' : 'start'}</button>
+          {isViewer && !remoteStream && (
+            <button onClick={(e) => { e.stopPropagation(); connectAsViewer(); }} style={TINY_BTN}>reconnect</button>
+          )}
+          {!isViewer && (
+            <button onClick={(e) => { e.stopPropagation(); localSharing ? stopShare() : startShare(); }} style={TINY_BTN}>{localSharing ? 'stop' : 'start'}</button>
+          )}
           <XIcon size={13} style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); onDelete(); }} />
         </div>
       </div>
-      {sharing ? (
+      {showVideo ? (
         <video ref={videoRef} autoPlay muted playsInline style={{ width: '100%', height: win.h - 30, display: 'block', objectFit: 'contain', background: '#000' }} />
       ) : (
         <div style={{ height: win.h - 30, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, padding: 16, textAlign: 'center' }}>
           <MonitorIcon size={26} style={{ color: '#5A6B60' }} />
           <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', lineHeight: 1.5, color: '#8FA396' }}>
-            {error || 'Pick a screen, window, or tab to share.'}
+            {error || (isViewer ? `Waiting for ${sharerLabel}'s screen…` : 'Pick a screen, window, or tab to share with everyone in the box.')}
           </div>
-          <button onClick={(e) => { e.stopPropagation(); startShare(); }} style={PRIMARY_BTN}>
-            <MonitorIcon size={13} /> Start sharing
-          </button>
+          {!isViewer && (
+            <button onClick={(e) => { e.stopPropagation(); startShare(); }} style={PRIMARY_BTN}>
+              <MonitorIcon size={13} /> Start sharing
+            </button>
+          )}
         </div>
       )}
       <div {...resizeRef} style={RESIZE_HANDLE_STYLE} />
@@ -831,6 +1090,7 @@ function UsBoxCanvas() {
   const [connectFrom, setConnectFrom] = useState(null);
   const [savedRooms, setSavedRooms] = useState(() => upsertSavedRoom(initialRoom.code, initialRoom.title));
   const [showRoomPanel, setShowRoomPanel] = useState(false);
+  const [videoSyncStates, setVideoSyncStates] = useState({});
 
   // Sound triggering AudioContext fallback
   const playLocalBeep = (freq, type = 'sine') => {
@@ -889,6 +1149,29 @@ function UsBoxCanvas() {
       const soundFrequencies = { airhorn: 440, laugh: 330, buzzer: 180, applause: 600 };
       playLocalBeep(soundFrequencies[msg.soundId] || 440, msg.soundId === 'buzzer' ? 'sawtooth' : 'sine');
     }
+    if (msg.t === 'video:sync') {
+      setVideoSyncStates((prev) => ({
+        ...prev,
+        [msg.objId]: { playing: msg.playing, currentTime: msg.currentTime, videoId: msg.videoId, userId: msg.userId, ts: Date.now() },
+      }));
+    }
+    if (msg.t === 'video:state_request') {
+      videoBus.emit(msg);
+    }
+    if (msg.t === 'screenshare:start') {
+      setObjects((prev) => prev.map((o) => (
+        o.id === msg.objId ? { ...o, sharing: true, sharerUserId: msg.userId, sharerName: msg.sharerName || 'Someone' } : o
+      )));
+    }
+    if (msg.t === 'screenshare:stop') {
+      setObjects((prev) => prev.map((o) => (
+        o.id === msg.objId ? { ...o, sharing: false, sharerUserId: null, sharerName: null } : o
+      )));
+      rtcBus.emit(msg);
+    }
+    if (msg.t?.startsWith('webrtc:')) {
+      rtcBus.emit(msg);
+    }
   }, []);
 
   // Pass current local state accessor to useRoomSocket to share with joining clients
@@ -896,7 +1179,7 @@ function UsBoxCanvas() {
     return { title: roomTitle, objects, connectors };
   }, [roomTitle, objects, connectors]);
 
-  const { send, presence } = useRoomSocket(roomCode, SELF_NAME, SELF_COLOR, handleRemoteSync, getLocalState);
+  const { send, presence, myUserId } = useRoomSocket(roomCode, SELF_NAME, SELF_COLOR, handleRemoteSync, getLocalState);
 
   const [micOn, setMicOn] = useState(false);
   const [micError, setMicError] = useState(null);
@@ -1077,7 +1360,7 @@ function UsBoxCanvas() {
 
   const addScreenShare = useCallback(() => {
     const center = screenToWorld({ x: (containerRef.current?.clientWidth ?? 800) / 2, y: (containerRef.current?.clientHeight ?? 600) / 2 }, viewport);
-    const win = { kind: 'screenshare', id: uid('share'), x: center.x - 200, y: center.y - 140, w: 400, h: 280, layer: nextLayer(objects) };
+    const win = { kind: 'screenshare', id: uid('share'), x: center.x - 200, y: center.y - 140, w: 400, h: 280, layer: nextLayer(objects), sharing: false, sharerUserId: null, sharerName: null };
     setObjects((prev) => [...prev, win]);
     send({ t: 'object:create', obj: win });
   }, [viewport, objects, send]);
@@ -1163,10 +1446,10 @@ function UsBoxCanvas() {
           <ConnectorLayer connectors={connectors} objects={objectById} onJump={jumpToObject} />
           {objects.slice().sort((a, b) => a.layer - b.layer).map((obj) => {
             if (obj.kind === 'video') {
-              return <VideoWindowCard key={obj.id} win={obj} selected={connectFrom === obj.id} onFocus={() => bringToFront(obj.id)} onChange={(patch) => updateObject(obj.id, patch)} onDelete={() => deleteObject(obj.id)} onClickForConnect={() => handleObjectClickForConnect(obj.id)} connectMode={tool === 'connect'} viewportZoom={viewport.zoom} />;
+              return <VideoWindowCard key={obj.id} win={obj} selected={connectFrom === obj.id} onFocus={() => bringToFront(obj.id)} onChange={(patch) => updateObject(obj.id, patch)} onDelete={() => deleteObject(obj.id)} onClickForConnect={() => handleObjectClickForConnect(obj.id)} connectMode={tool === 'connect'} viewportZoom={viewport.zoom} send={send} syncState={videoSyncStates[obj.id]} />;
             }
             if (obj.kind === 'screenshare') {
-              return <ScreenShareWindowCard key={obj.id} win={obj} selected={connectFrom === obj.id} onFocus={() => bringToFront(obj.id)} onChange={(patch) => updateObject(obj.id, patch)} onDelete={() => deleteObject(obj.id)} onClickForConnect={() => handleObjectClickForConnect(obj.id)} connectMode={tool === 'connect'} viewportZoom={viewport.zoom} />;
+              return <ScreenShareWindowCard key={obj.id} win={obj} selected={connectFrom === obj.id} onFocus={() => bringToFront(obj.id)} onChange={(patch) => updateObject(obj.id, patch)} onDelete={() => deleteObject(obj.id)} onClickForConnect={() => handleObjectClickForConnect(obj.id)} connectMode={tool === 'connect'} viewportZoom={viewport.zoom} send={send} myUserId={myUserId} selfName={SELF_NAME} />;
             }
             if (obj.kind === 'sticky') {
               return <StickyNoteCard key={obj.id} note={obj} selected={connectFrom === obj.id} onFocus={() => bringToFront(obj.id)} onChange={(patch) => updateObject(obj.id, patch)} onDelete={() => deleteObject(obj.id)} onClickForConnect={() => handleObjectClickForConnect(obj.id)} connectMode={tool === 'connect'} viewportZoom={viewport.zoom} />;
@@ -1184,7 +1467,7 @@ function UsBoxCanvas() {
       <ZoomControls zoom={viewport.zoom} onZoomIn={() => setViewport((vp) => ({ ...vp, zoom: clamp(vp.zoom * 1.15, 0.2, 3) }))} onZoomOut={() => setViewport((vp) => ({ ...vp, zoom: clamp(vp.zoom / 1.15, 0.2, 3) }))} onReset={() => setViewport({ x: -400, y: -260, zoom: 1 })} />
       {!IS_PREMIUM && (
         <div style={FREE_TIER_BADGE}>
-          Live Room · {FREE_CANVAS_BOUND}×{FREE_CANVAS_BOUND} bounds · <span style={{ color: '#E7A93D', fontWeight: 600 }}>Syncing Active</span>
+          Live Room · {FREE_CANVAS_BOUND}×{FREE_CANVAS_BOUND} bounds · <span style={{ color: '#E7A93D', fontWeight: 600 }}>Videos & screen share sync</span>
         </div>
       )}
       {IS_FILE_PROTOCOL && <FileProtocolNotice />}
